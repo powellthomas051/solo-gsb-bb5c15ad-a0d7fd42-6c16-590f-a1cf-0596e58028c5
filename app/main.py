@@ -325,9 +325,15 @@ def submit_job(
             "logical submission: the first request creates the job (201); "
             "retries with identical parameters return the job's current "
             "object (200) without re-applying any side effect, while the same "
-            "key reused with different parameters gets 409. A failed "
-            "submission does not consume the key. Omit the header (or send it "
-            "blank) for the original non-idempotent behaviour."
+            "key reused with different parameters gets 409. The stored "
+            "fingerprint is compared before any capacity judgement, so a "
+            "matching replay still returns the job (200) and a mismatch "
+            "still conflicts (409) even when the request exceeds the current "
+            "cluster capacity (e.g. CLUSTER_GPUS was lowered after the "
+            "original submission); only a first-time submission is "
+            "capacity-checked. A failed submission does not consume the "
+            "key. Omit the header (or send it blank) for the original "
+            "non-idempotent behaviour."
         ),
     ),
 ):

@@ -218,6 +218,16 @@ dependencies; the HTTP layer answers such a replay with 200 rather than 201.
 The same key reused with different fingerprint parameters is rejected with
 409.
 
+Decision order for a keyed request: the stored fingerprint is authoritative
+and is compared **before** any capacity judgement. A replay whose parameters
+match therefore returns the job's current object (200) even when the
+original request would exceed the *current* cluster capacity — for example
+after a restart with a lowered ``CLUSTER_GPUS`` — and a mismatching retry is
+rejected with 409 even when the new parameters themselves exceed the current
+capacity. Only a first-time submission (no record for the key) is validated
+against the current capacity and then created; a key-less submission keeps
+the original rule and is always validated up front.
+
 A submission that fails validation inside the transaction (unknown
 prerequisite, dependency cycle, capacity overflow...) rolls everything
 back, including the idempotency record attempt, so a failed submission does
@@ -774,6 +784,11 @@ def submit_job_idempotent(
       object and never re-touches tenant weight, queue time or dependencies.
     * A retry carrying the same key but different parameters raises
       :class:`Conflict` (409).
+    * The stored fingerprint is compared before any capacity judgement: a
+      matching replay returns the job's current object and a mismatch
+      conflicts even when the request exceeds the *current* cluster capacity
+      (e.g. ``CLUSTER_GPUS`` was lowered after the original submission).
+      Only a first-time submission (key miss) is capacity-checked.
     * A failed submission (unknown prerequisite, cycle, capacity overflow,
       etc.) rolls the whole transaction back, so the key is not consumed and a
       later corrected request still creates the job.
@@ -818,7 +833,15 @@ def _submit_job(
     depends_on = sorted(set(depends_on))
 
     settings = get_settings()
-    if gpus > settings.cluster_gpus:
+    # Capacity is judged against the CURRENT cluster size only on the path
+    # that actually creates a job. Without a key that is every request, so
+    # the original up-front rule applies unchanged. With a key the stored
+    # fingerprint is compared first (inside the transaction below): a replay
+    # returns the job's current state and a mismatch conflicts, even when the
+    # request now exceeds the current capacity — e.g. CLUSTER_GPUS was
+    # lowered across a restart after the original submission. Only a
+    # first-time (key-miss) submission is capacity-checked, before any write.
+    if idempotency_key is None and gpus > settings.cluster_gpus:
         raise SchedulerError(
             f"job requests {gpus} GPUs which exceeds cluster capacity "
             f"{settings.cluster_gpus}; it could never run"
@@ -843,6 +866,15 @@ def _submit_job(
             if existing is not None:
                 return _idempotent_replay(conn, existing, tenant_id, gpus,
                                           duration_min, weight, depends_on)
+            # Key miss: this first-time submission — and only it — is
+            # validated against the current cluster capacity. The check still
+            # precedes every write, so a failure rolls back cleanly and does
+            # not consume the key.
+            if gpus > settings.cluster_gpus:
+                raise SchedulerError(
+                    f"job requests {gpus} GPUs which exceeds cluster capacity "
+                    f"{settings.cluster_gpus}; it could never run"
+                )
 
         # Auto-register unknown tenants so a single POST /jobs is enough.
         if conn.execute(

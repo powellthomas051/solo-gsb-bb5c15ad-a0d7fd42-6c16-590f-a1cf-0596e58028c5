@@ -98,7 +98,8 @@ def test_conflicting_depends_on_detected(conn):
 
 
 def test_failed_submission_does_not_consume_key(conn):
-    # Pre-transaction validation failure (capacity overflow).
+    # Capacity overflow on a first-time keyed submission (rejected before
+    # any write; the key is not consumed).
     with pytest.raises(scheduler.SchedulerError):
         submit(body_key="k1", gpus=99, duration_min=10)
 
@@ -166,6 +167,83 @@ def test_replay_returns_current_job_state(conn):
     assert replay["status"] == "COMPLETED"
 
 
+def _lower_cluster_capacity(monkeypatch, gpus: int) -> None:
+    """Simulate a restart with a smaller CLUSTER_GPUS."""
+    monkeypatch.setenv("CLUSTER_GPUS", str(gpus))
+    get_settings.cache_clear()
+
+
+def test_replay_after_capacity_reduction_returns_current_job(conn, monkeypatch):
+    # Original request exactly fills the capacity-8 cluster.
+    job, created = submit(body_key="k1", gpus=8, duration_min=10)
+    assert created is True
+    scheduler.run_batch()  # QUEUED -> RUNNING at capacity 8
+
+    # Restart with CLUSTER_GPUS lowered to 4: the original request now
+    # exceeds the current capacity, but the stored fingerprint decides first.
+    _lower_cluster_capacity(monkeypatch, 4)
+    tenant_before = db.get_conn().execute(
+        "SELECT weight, updated_at FROM tenants WHERE id = 't'"
+    ).fetchone()
+    ledger_before = db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM ledger"
+    ).fetchone()["n"]
+
+    replay, created = submit(body_key="k1", gpus=8, duration_min=10)
+    assert created is False
+    assert replay["id"] == job["id"]
+    assert replay["status"] == "RUNNING"  # the job's CURRENT state
+
+    # The replay rewrote nothing: tenant row, ledger and job count unchanged.
+    tenant_after = db.get_conn().execute(
+        "SELECT weight, updated_at FROM tenants WHERE id = 't'"
+    ).fetchone()
+    assert dict(tenant_after) == dict(tenant_before)
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM ledger"
+    ).fetchone()["n"] == ledger_before
+    assert len(scheduler.list_jobs(tenant_id="t")) == 1
+
+
+def test_conflict_after_capacity_reduction_even_over_capacity(conn, monkeypatch):
+    job, _ = submit(body_key="k1", gpus=2, duration_min=10)
+    _lower_cluster_capacity(monkeypatch, 4)
+
+    # Different parameters that THEMSELVES exceed the current capacity:
+    # the fingerprint mismatch (409) is judged before capacity (400).
+    with pytest.raises(scheduler.Conflict) as exc:
+        submit(body_key="k1", gpus=6, duration_min=10)
+    assert exc.value.status_code == 409
+
+    # Different parameters within the current capacity conflict as well.
+    with pytest.raises(scheduler.Conflict):
+        submit(body_key="k1", gpus=3, duration_min=10)
+
+    assert [j["id"] for j in scheduler.list_jobs(tenant_id="t")] == [job["id"]]
+
+
+def test_first_time_keyed_submission_uses_current_capacity(conn, monkeypatch):
+    _lower_cluster_capacity(monkeypatch, 4)
+    # Key miss: the first-time submission is validated against the CURRENT
+    # capacity and fails without consuming the key.
+    with pytest.raises(scheduler.SchedulerError) as exc:
+        submit(body_key="k1", gpus=5, duration_min=10)
+    assert exc.value.status_code == 400
+    assert db.get_conn().execute(
+        "SELECT COUNT(*) AS n FROM idempotent_jobs"
+    ).fetchone()["n"] == 0
+
+    # A corrected retry with the same key still creates the job.
+    job, created = submit(body_key="k1", gpus=4, duration_min=10)
+    assert created is True
+    # ...and a request within the current capacity but WITHOUT a key is
+    # independent of it; an over-capacity key-less request is still rejected.
+    with pytest.raises(scheduler.SchedulerError) as exc:
+        submit(gpus=5, duration_min=10)
+    assert exc.value.status_code == 400
+    assert [j["id"] for j in scheduler.list_jobs(tenant_id="t")] == [job["id"]]
+
+
 def test_concurrent_first_submissions_create_one_job(conn):
     import threading
 
@@ -216,6 +294,44 @@ def test_replay_survives_restart_with_file_db(tmp_path, monkeypatch):
         )
         assert created2 is False
         assert replay["id"] == job["id"]
+        assert len(scheduler.list_jobs(tenant_id="t")) == 1
+    finally:
+        db.get_conn().close()
+        db.reset_for_tests()
+        get_settings.cache_clear()
+
+
+def test_replay_survives_restart_with_lowered_capacity(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "restart-lowered.db")
+    monkeypatch.setenv("DB_PATH", db_path)
+    monkeypatch.setenv("CLUSTER_GPUS", "8")
+    get_settings.cache_clear()
+
+    db.reset_for_tests()
+    db.connect(db_path)
+    job, created = scheduler.submit_job_idempotent(
+        "t", 8, 15, 1.0, [], idempotency_key="persist"
+    )
+    assert created is True
+    db.get_conn().close()
+    db.reset_for_tests()
+
+    # Restart with CLUSTER_GPUS lowered to 4: the original 8-GPU request now
+    # exceeds the current capacity. The stored fingerprint still decides
+    # first: identical parameters replay the job, different ones conflict.
+    monkeypatch.setenv("CLUSTER_GPUS", "4")
+    get_settings.cache_clear()
+    db.connect(db_path)
+    try:
+        replay, created2 = scheduler.submit_job_idempotent(
+            "t", 8, 15, 1.0, [], idempotency_key="persist"
+        )
+        assert created2 is False
+        assert replay["id"] == job["id"]
+        with pytest.raises(scheduler.Conflict):
+            scheduler.submit_job_idempotent(
+                "t", 6, 15, 1.0, [], idempotency_key="persist"
+            )
         assert len(scheduler.list_jobs(tenant_id="t")) == 1
     finally:
         db.get_conn().close()
@@ -350,3 +466,45 @@ def test_http_key_scoped_by_tenant(client):
         headers=HEADERS)
     assert r1.status_code == r2.status_code == 201
     assert r1.json()["id"] != r2.json()["id"]
+
+
+def test_http_fingerprint_decides_before_capacity(client, monkeypatch):
+    # First submission fills the capacity-8 cluster exactly.
+    body = {"tenant_id": "team-a", "gpus": 8, "duration_min": 30, "weight": 1}
+    r = client.post("/jobs", json=body, headers=HEADERS)
+    assert r.status_code == 201, r.text
+    job_id = r.json()["id"]
+
+    # Restart with CLUSTER_GPUS lowered to 4: the original request now
+    # exceeds the current capacity.
+    monkeypatch.setenv("CLUSTER_GPUS", "4")
+    get_settings.cache_clear()
+
+    # Identical retry -> 200 with the job's current object, not a 400.
+    r = client.post("/jobs", json=body, headers=HEADERS)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == job_id
+
+    # Same key with different parameters -> 409, even though the new
+    # parameters themselves exceed the current capacity.
+    r = client.post("/jobs", json={**body, "gpus": 6}, headers=HEADERS)
+    assert r.status_code == 409
+    assert "Idempotency-Key" in r.json()["error"]
+
+    # A NEW key (first-time submission) is validated against the current
+    # capacity -> 400, and the failure does not consume that key.
+    other = {"Idempotency-Key": "other-key"}
+    r = client.post("/jobs", json={**body, "gpus": 6}, headers=other)
+    assert r.status_code == 400
+    r = client.post("/jobs", json={**body, "gpus": 4}, headers=other)
+    assert r.status_code == 201, r.text
+
+    # Key-less submissions keep the original rule: over current capacity
+    # -> 400; every key-less request creates a new job.
+    r = client.post("/jobs", json={**body, "gpus": 6})
+    assert r.status_code == 400
+    r = client.post("/jobs", json={**body, "gpus": 4})
+    assert r.status_code == 201
+
+    # Exactly three jobs exist: the replay/conflict created nothing.
+    assert len(client.get("/jobs").json()) == 3
