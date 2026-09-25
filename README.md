@@ -359,7 +359,10 @@ curl -X POST http://localhost:8000/jobs/graph \
 | `AGING_CAP_GPU_MIN` | 空（无上限） | 单批次老化补偿上限 |
 | `DB_PATH` | `/data/scheduler.db` | SQLite 文件路径 |
 
-提交作业时若 `gpus > CLUSTER_GPUS`（永远无法运行）会被拒绝（400）。
+提交作业时若 `gpus > CLUSTER_GPUS`（永远无法运行）会被拒绝（400）。无
+`Idempotency-Key` 的提交始终按当前容量校验；带 key 时只有**未命中的首次提交**
+按当前容量校验——命中已有 key 的重试先比对已保存指纹（同参 200、异参 409），
+容量下调不会让同参重试变成 400（见下文「幂等提交」一节）。
 
 > 注意：租户的并发 GPU 上限 `max_gpus` 与滚动 24 小时 GPU-分钟预算
 > `budget_gpu_min` **都不是**环境变量，而是通过接口逐租户设置并持久化在
@@ -441,22 +444,27 @@ curl -X POST http://localhost:8000/jobs \
 生成，如 UUID）。幂等域为 **`tenant_id` + 非空 key**：同一租户使用相同 key 的
 多次请求只代表一次提交；不同租户使用相同 key 互不影响。
 
-- **首次请求（201）**：在现有的同一笔 SQLite 提交事务中，同时写入租户（自动
-  注册/权重）、作业、依赖边以及一条幂等凭据记录。凭据保存**规范化后的参数指纹**：
-  `gpus`、`duration_min`、`weight` 与**去重并排序后的** `depends_on`，以及创建
-  出的作业 id。
-- **相同参数重试（200）**：返回该作业的**当前对象**（可能已被派发/完成/取消），
-  **不再更新**租户权重（含 `updated_at`）、**不改变排队时间** `queued_at`、
-  **不重复写入依赖**，也不会新建第二个作业。
-- **相同 key、参数不同（409）**：返回冲突错误，不创建任何作业。
-- **失败提交不占用 key**：超容量、未知依赖、依赖环等失败（无论发生在事务开启前
-  还是事务内）都会整体回滚，凭据不会落库；用同一 key 修正参数后重试仍会创建
-  作业。
+- **判定顺序（重要）**：带 key 的请求进入写事务后，**先比对该
+  `(tenant_id, key)` 已保存的请求指纹，再做任何容量判定或写入**：
+  1. **命中已保存凭据**：指纹相同 → 返回该作业的**当前对象**（可能已被
+     派发/完成/取消，HTTP **200**），**不再更新**租户权重（含
+     `updated_at`）、**不改变排队时间** `queued_at`、**不重复写入依赖**、
+     不新建第二个作业，并且**完全不再按当前容量重新校验**——即使服务重启时
+     `CLUSTER_GPUS` 被下调、使原请求现在已经超过现有容量，重试依旧返回该
+     作业当前状态与 200；指纹不同（参数被改动）→ **409**，且**与当前容量
+     无关**——哪怕新参数本身就超过当前容量，也是 409。
+  2. **未命中（该 key 的首次提交）**：此时才按**当前** `CLUSTER_GPUS`
+     做容量校验，通过才创建并落库指纹；任一失败（超容量、未知依赖、依赖环
+     等，无论发生在事务开启前还是事务内）整体回滚，**失败不占用 key**，用
+     同一 key 修正参数后重试仍会创建作业。
+- **无 key（或值为空白）提交完全沿用原接口**：每次请求都新建作业、返回 201，
+  容量校验照旧始终按当前 `CLUSTER_GPUS` 执行（重启后容量下调，无 key 的
+  超容量请求仍返回 400）。
 - **并发与重启**：同一 (tenant, key) 的并发首次请求——无论是同进程多线程、多个
   容器进程共享同一个 SQLite 文件，还是客户端/容器重启后重试——都**只会创建一个
   作业**（进程写锁 + `BEGIN IMMEDIATE` 串行化，数据库 `PRIMARY KEY
-  (tenant_id, idempotency_key)` 唯一约束兜底，凭据随命名卷持久化）。
-- **不传该头（或值为空白）时完全沿用原接口**：每次请求都新建作业、返回 201。
+  (tenant_id, idempotency_key)` 唯一约束兜底，凭据随命名卷持久化）。重启后重试
+  绝不改写租户、作业或账本。
 
 ```bash
 # 首次提交 201；网络重试时用完全相同的请求体与同一个 key
@@ -483,6 +491,30 @@ curl -X POST http://localhost:8000/jobs \
   -d '{"tenant_id":"team-a","gpus":4,"duration_min":30}'
 # 409 {"error":"Idempotency-Key '...' for tenant 'team-a' was already used
 #       with different parameters; existing job: J000004"}
+```
+
+重启后容量下调（如把 docker-compose.yml 的 `CLUSTER_GPUS` 由 `8` 改为 `4` 并
+重建容器）时，重试规则依旧只看已保存指纹，不按新容量二次校验：
+
+```bash
+# 容量为 8 时首次提交 6 GPU 作业 -> 201
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: retry-after-shrink' \
+  -d '{"tenant_id":"team-a","gpus":6,"duration_min":30}'
+
+# …随后 CLUSTER_GPUS 下调为 4，服务重启…
+
+# 相同 key + 相同参数（现在已超过当前容量 4）-> 仍是 200，返回作业当前对象
+curl -X POST http://localhost:8000/jobs \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: retry-after-shrink' \
+  -d '{"tenant_id":"team-a","gpus":6,"duration_min":30}'
+# 200 {"id":"J....", ...}   （作业可能已 RUNNING/COMPLETED/CANCELLED）
+
+# 相同 key + 不同参数（无论 5 GPU 超容量，还是 2 GPU 不超容量）-> 一律 409
+# 新 key 的首次提交才按当前容量校验：6 GPU -> 400，且失败不占用该新 key；
+# 改成 4 GPU 后用同一新 key 重试 -> 201
 ```
 
 依赖提交示例（`J000002` 等 `J000001` 完成后才可调度）：
@@ -880,7 +912,7 @@ curl -s -G localhost:8000/jobs/J000001/maintenance-slots \
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/jobs` | 提交作业（自动注册/更新租户权重，支持 `depends_on` 依赖）；可选请求头 **`Idempotency-Key`** 实现按 `tenant_id + key` 的幂等提交（首次 201、同参重试 200 返回作业当前对象且无副作用、异参 409、失败不占 key），不传则沿用原接口 |
+| POST | `/jobs` | 提交作业（自动注册/更新租户权重，支持 `depends_on` 依赖）；可选请求头 **`Idempotency-Key`** 实现按 `tenant_id + key` 的幂等提交（事务内先比对已保存指纹：同参重试 200 返回作业当前对象且无副作用，即使重启后 `CLUSTER_GPUS` 下调使原请求超容量；异参 409，包括新参数本身超容量的情况；仅未命中的首次提交按当前容量校验、失败不占 key），不传则沿用原接口（始终按当前容量校验） |
 | POST | `/jobs/graph` | **批量作业图提交（单事务原子落库）**：非空 `jobs` 数组，每项带本批唯一 `ref`、`tenant_id/gpus/duration_min/weight`，`depends_on` 引已有作业 id、`depends_on_refs` 引批内 ref（允许前向及跨租户引用）；同租户多项 weight 不一致报 400；同事务校验资源参数、外部引用与整图环路后分配顺序 id、写租户/作业/依赖；任一错误整批回滚、不改租户权重或队列；返回 `ref_ids`（ref→id）与作业对象，新作业立即遵循现有预演/正式批次依赖判定 |
 | GET | `/jobs` | 列作业（可选 `status`、`tenant_id`） |
 | GET | `/jobs/{id}` | 作业详情 |
@@ -1020,8 +1052,8 @@ curl -s -X POST localhost:8000/scheduler/preview     # 新作业立即按现有�
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 
-# 运行全部测试（209 个：服务层算法/依赖/批量作业图提交/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
-# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交/依赖就绪老化 + HTTP 端到端）
+# 运行全部测试（215 个：服务层算法/依赖/批量作业图提交/依赖修订/依赖取消级联/用量汇总/租户 GPU 上限/
+# 滚动 24h GPU-分钟预算/批次预演/GPU 维护时段/维护空档查询/POST /jobs 幂等提交（含容量下调后重试判定顺序）/依赖就绪老化 + HTTP 端到端）
 .venv/bin/python -m pytest -q
 
 # 无需第三方库的核心算法验证脚本（仅用标准库 sqlite3）
@@ -1048,7 +1080,7 @@ tests/
   test_preview.py      # 预演测试：与正式批次决策一致、零写入、异常回滚
   test_maintenance.py  # 维护时段：持久化/校验、重叠准入、端点相接、RUNNING 不抢占、预演一致
   test_maintenance_slots.py  # 维护空档查询：可行开始时刻区间合并、端点相接、孤立时刻、固定 RUNNING 基线、HTTP
-  test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业
+  test_idempotency.py  # POST /jobs 幂等：首次/重试/409、失败不占 key、依赖规范化、租户隔离、并发与重启只建一个作业、重启后 CLUSTER_GPUS 下调时同参重试仍 200/异参仍 409/新 key 首次才按当前容量校验
   test_dependencies_revision.py  # 依赖修订：整体替换/清空、跨租户、QUEUED 限定、拒绝保持原依赖、预演与批次生效、幂等指纹保留
   test_aging_readiness.py  # 依赖就绪老化：信用只从队首真正就绪时刻累计（最后前置完成/解除阻塞的修订时刻），与老化结算点取较晚值，预演一致且零写入
   test_cancel_cascade.py  # 依赖取消级联：传递闭包、穿过已取消/不穿过已完成、最短依赖链、预览零写入、级联原子取消与 GPU 释放、404/409

@@ -210,20 +210,30 @@ The first successful request commits, in one existing SQLite transaction,
 the tenant auto-register/weight upsert, the job, its dependency edges and an
 ``idempotent_jobs`` row holding the normalised fingerprint — ``gpus``,
 ``duration_min``, ``weight`` and the deduplicated, sorted ``depends_on`` —
-plus the resulting job id. A retry with the same fingerprint resolves to
-that record *before any write*, so it returns the job's **current** object
-(the job may since have been dispatched, completed or cancelled) and never
-updates the tenant weight, ``updated_at``, the job's ``queued_at`` or its
-dependencies; the HTTP layer answers such a replay with 200 rather than 201.
-The same key reused with different fingerprint parameters is rejected with
-409.
+plus the resulting job id. On a retry the stored record is looked up
+**inside the write transaction, before any admission decision or write**, so
+the ordering is always:
 
-A submission that fails validation inside the transaction (unknown
-prerequisite, dependency cycle, capacity overflow...) rolls everything
-back, including the idempotency record attempt, so a failed submission does
-not consume the key and a corrected retry still creates the job. Failures
-detected before the transaction opens (basic parameter shape) likewise
-never touch it.
+1. the ``(tenant_id, key)`` pair already has a saved record -> compare the
+   saved fingerprint with the request first. An equal fingerprint resolves
+   to that record and returns the job's **current** object (the job may since
+   have been dispatched, completed or cancelled; HTTP 200) **without any
+   capacity re-validation** — even when ``CLUSTER_GPUS`` was lowered after the
+   original submission so the saved request now exceeds the present capacity.
+   The retry never updates the tenant weight, ``updated_at``, the job's
+   ``queued_at`` or its dependencies; a differing fingerprint is rejected
+   with 409 **regardless of current capacity** (including the case where the
+   new parameters themselves exceed it).
+2. no saved record (first submission with the key) -> only then is the
+   request admitted against the cluster's *current* capacity and, if it fits,
+   the tenant/job/edges/fingerprint are inserted. Any failure rolls the whole
+   transaction back, so a failed first attempt does not consume the key and a
+   corrected retry still creates the job.
+
+Failures detected before the transaction opens (basic parameter shape)
+likewise never touch the record. A submission **without** a key keeps the
+original interface and is capacity-checked by the same pre-transaction rule
+as always.
 
 A later dependency revision (``PATCH /jobs/{id}/dependencies``) never
 rewrites the stored fingerprint: a replay of the original submission still
@@ -236,7 +246,8 @@ file, the ``PRIMARY KEY (tenant_id, idempotency_key)`` constraint plus
 ``busy_timeout`` make the loser resolve as a replay of the winner — exactly
 one job is ever created per key. Because the record lives in the same
 persistent database file, a client or container restart followed by a retry
-still returns the single already-created job.
+(even one that redeploys a smaller ``CLUSTER_GPUS``) still returns the single
+already-created job.
 
 GPU maintenance windows
 =======================
@@ -768,15 +779,21 @@ def submit_job_idempotent(
 
     Semantics (see the module-level "Idempotent submission" section):
 
-    * The fingerprint (gpus, duration_min, weight, deduplicated+sorted
-      depends_on) is stored in the same transaction as the job, the tenant
-      upsert and the dependency edges, so a replay returns the job's *current*
-      object and never re-touches tenant weight, queue time or dependencies.
-    * A retry carrying the same key but different parameters raises
-      :class:`Conflict` (409).
-    * A failed submission (unknown prerequisite, cycle, capacity overflow,
-      etc.) rolls the whole transaction back, so the key is not consumed and a
-      later corrected request still creates the job.
+    * Inside the write transaction the saved fingerprint is compared FIRST:
+      an existing (tenant, key) record with the same fingerprint returns the
+      job's *current* object (``created=False``) with no capacity
+      re-validation — this still holds after a restart whose ``CLUSTER_GPUS``
+      was lowered below the saved request — while a record whose fingerprint
+      differs raises :class:`Conflict` (409) even if the new parameters
+      exceed the current capacity.
+    * Only an unmatched first submission is admitted against the cluster's
+      current capacity, after which the fingerprint (gpus, duration_min,
+      weight, deduplicated+sorted depends_on) is stored in the same
+      transaction as the job, the tenant upsert and the dependency edges; a
+      replay then never re-touches tenant weight, queue time or dependencies.
+    * A failed first submission (unknown prerequisite, cycle, capacity
+      overflow, etc.) rolls the whole transaction back, so the key is not
+      consumed and a later corrected request still creates the job.
     * Concurrency is serialised by the process lock plus a
       ``BEGIN IMMEDIATE`` write transaction; with multiple containers sharing
       the SQLite file the UNIQUE primary key plus ``busy_timeout`` provide the
@@ -818,7 +835,14 @@ def _submit_job(
     depends_on = sorted(set(depends_on))
 
     settings = get_settings()
-    if gpus > settings.cluster_gpus:
+    # Keyed submissions postpone the capacity gate until the transaction has
+    # checked for a stored fingerprint: a replay (same params) must return the
+    # job's current state even when CLUSTER_GPUS was lowered after the job was
+    # created, and a key reuse with different params must 409 even when the new
+    # params themselves exceed the current capacity. Only an unmatched first
+    # submission is judged against current capacity; a keyless request keeps
+    # the original pre-transaction validation.
+    if idempotency_key is None and gpus > settings.cluster_gpus:
         raise SchedulerError(
             f"job requests {gpus} GPUs which exceeds cluster capacity "
             f"{settings.cluster_gpus}; it could never run"
@@ -832,8 +856,10 @@ def _submit_job(
 
         # Idempotent replay check: an existing record for (tenant, key) either
         # resolves to the already-created job or proves the parameters
-        # diverged. This precedes every write, so a replay updates neither the
-        # tenant's weight/updated_at nor any queue timestamp.
+        # diverged. This precedes every write AND every admission decision,
+        # so a replay updates neither the tenant's weight/updated_at nor any
+        # queue timestamp, and is never re-validated against a capacity that
+        # may have shrunk since the original submission.
         if idempotency_key is not None:
             existing = conn.execute(
                 "SELECT * FROM idempotent_jobs "
@@ -843,6 +869,16 @@ def _submit_job(
             if existing is not None:
                 return _idempotent_replay(conn, existing, tenant_id, gpus,
                                           duration_min, weight, depends_on)
+
+            # First submission with this key: judge the request against the
+            # cluster's CURRENT capacity, inside the transaction. Failure here
+            # (and any later failure) rolls the whole transaction back, so the
+            # key stays unconsumed.
+            if gpus > settings.cluster_gpus:
+                raise SchedulerError(
+                    f"job requests {gpus} GPUs which exceeds cluster capacity "
+                    f"{settings.cluster_gpus}; it could never run"
+                )
 
         # Auto-register unknown tenants so a single POST /jobs is enough.
         if conn.execute(
